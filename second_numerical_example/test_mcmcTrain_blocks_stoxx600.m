@@ -1,0 +1,2076 @@
+clear all;
+close all;
+%randn('seed',0);
+%rand('seed',0);
+outdir = 'diagrams/';
+rng('default')
+%%
+load stoxx600_daily_adj_close_and_rets.mat;
+%%
+data_d=data_d(1:300,3642:4387);
+time_d=time_d(:,3642:4387);
+adj_d=adj_d(1:300,3642:4387);
+size(data_d)
+%%
+model.horizon  = 1; %forecast horizon
+Y =(data_d(:,1:end-model.horizon));
+model.Y=Y;
+model.actual = (data_d(:,end-model.horizon+1:end));
+[N,T]=size(Y);
+K=30;
+%Y=data_d;
+%if forecasting
+% USER defined options
+%
+% -- Factor model or just simple MSV -- 
+%    yes: factor MSV
+%    no:  simple MSV  
+model.useFactorModel = 'yes'; 
+%
+% -- Sample factors by Gibbs or not --
+%    (this option has *no effect* if model.useFactorModel = 'no')
+%      yes: it samples the factors by Gibbs (expensive, but exact) 
+%      no:  it samples the factors by auxiliary Langevin (faster)
+model.sampleFactorsByGibbs = 'no'; 
+%
+% -- Diagonal Sigmat matrix or not (i.e. indepedent factors or not) --
+%      yes: the Sigmat matrices are all diagonal (angles are zero) 
+%      no:  the Sigmat matrices have free form (angles are inferred)
+model.diagonalSigmat = 'no';
+%
+% -- Exchangeable prior for the phis or just simple independent Gaussian with very
+%    large variance
+%    yes: exchangeable with normal-inverse gamma hyerprior 
+%    no:  just a simple broad Gaussian 
+model.exchangeablePriorphi = 'no';
+
+if strcmp(model.useFactorModel, 'no') 
+    K = N; 
+end    
+
+% create the Givens set
+Givset = [];  % the indices 
+for i=1:K
+   for j=i+1:K
+       Givset = [Givset; i j];
+   end
+end
+tildeK = size(Givset,1);
+
+Ytrue = Y;
+
+% Add some missing values
+%probNan = 0.1;  
+%for t=1:T
+%    r = rand(N,1);
+%    r = find(r<=probNan); 
+%    Y(r, t) = NaN; 
+%end
+
+% START CREATING THE MODEL STRUCTURE
+model.N = N;
+model.T = T;
+model.K = K; 
+model.Givset = Givset;
+model.tildeK = size(Givset,1);
+
+% PARAMETER INITIALIZATION FOR THE MCMC
+model.deltas = zeros(model.tildeK, T); 
+model.omegas = (0.5*pi)*( (exp(model.deltas)-1)./(exp(model.deltas) + 1));
+model.hs = repmat(zeros(K,1), 1, T);
+model.lambdas = exp(model.hs);
+
+L = ones(N,K);
+L(1:K,1:K) = triu(ones(K,K))';
+
+% HYPERPARAMETER INITIALIZATION FOR MCMC
+ind =  ~isnan(model.Y(:)); 
+model.sigma2 = 0.01*var(model.Y(ind)); 
+model.L = L;
+model.Weights = randn(N,K);
+model.sigma2weights = 2;
+model.Ft = zeros(model.K, model.T);
+size(model.L)
+
+%%
+%model.FFt = Ft;
+model.phi_h = zeros(1 ,K);
+model.tildephi_h = log((1 + model.phi_h)./(1 - model.phi_h));
+model.h_0 = zeros(1 ,K);
+model.sigma2_h = ones(1, K);
+model.phi_delta = zeros(1, tildeK);
+model.tildephi_delta = log((1 + model.phi_delta)./(1 - model.phi_delta));
+model.delta_0 = zeros(1, tildeK);
+model.sigma2_delta = ones(1, tildeK); 
+
+% PRIOR OVER PHIS 
+if strcmp(model.exchangeablePriorphi, 'yes') 
+model.priorPhi_h.type = 'logmarginalizedNormalGam'; 
+model.priorPhi_h.mu0 = 0;
+model.priorPhi_h.k0 = 1;
+model.priorPhi_h.alpha0 = 1;
+model.priorPhi_h.beta0 = 1; 
+model.priorPhi_delta.type = 'logmarginalizedNormalGam'; 
+model.priorPhi_delta.mu0 = 0;
+model.priorPhi_delta.k0 = 1;
+model.priorPhi_delta.alpha0 = 1;
+model.priorPhi_delta.beta0 = 1; 
+else
+model.priorPhi_h.type = 'logNormal'; 
+model.priorPhi_h.mu0 = 0;
+model.priorPhi_h.s2 = 100;
+model.priorPhi_delta.type = 'logNormal'; 
+model.priorPhi_delta.mu0 = 0;
+model.priorPhi_delta.s2 = 100;
+end
+model.priorSigma2_h.sigmar = 5; 
+model.priorSigma2_h.Ssigma = 0.01*model.priorSigma2_h.sigmar;  
+model.priorSigma2_delta.sigmar = 5;
+model.priorSigma2_delta.Ssigma = 0.01*model.priorSigma2_delta.sigmar;  
+
+% INVERSE GAMMA PRIOR OVER THE LIKELIHOOD NOISE VARIANCE
+model.priorSigma2.type = 'invgamma';  
+model.priorSigma2.alpha0 = 0.001;
+model.priorSigma2.beta0 = 0.001;
+%%
+% MCMC OPTIONS FOR BURNIN AND SAMPLING PHASES
+mcmcoptions.adapt.T = 10;
+mcmcoptions.adapt.Burnin = 0;
+mcmcoptions.adapt.StoreEvery = 1;
+mcmcoptions.adapt.disp = 1;
+mcmcoptions.adapt.minAdapIters =10;
+mcmcoptions.train.T = 10;
+mcmcoptions.train.Burnin = 0;
+mcmcoptions.train.StoreEvery = 2;
+%%
+sanityCheckMSV('preMCMC', model, [], mcmcoptions);
+%%
+% HERE WE RUN THE MCMC ALGORITHM FIRST TO ADAPT THE PROPOSAL AND THEN TO
+% COLLECT THE SAMPLES
+
+rng(randi(10000),'twister');
+
+Langevin = 1;
+tic;
+[model PropDist samples accRates] = mcmcAdapt(model, mcmcoptions.adapt, Langevin);
+% training/sample collection phase
+elapsedAdapt=toc;
+
+%%
+adaptBundle = struct();
+adaptBundle.model = model;         % IMPORTANT: adapted model
+adaptBundle.PropDist = PropDist;
+adaptBundle.accRatesAdapt = accRates;
+adaptBundle_base = adaptBundle;
+%%
+dataset = 'sp500_daily_adj_close_and_rets_top400';   % or 'sp500', 'stoxx'
+timestamp = datestr(now,'yyyymmdd_HHMMSS');
+fname = sprintf(['adaptBundle_%s_' ...
+    'h%d_N%d_%s.mat'], ...
+    dataset, ...
+    model.horizon, ...
+    model.N, ...
+    timestamp);
+out_dir=pwd;
+save(fullfile(out_dir,"repro_runs" ,fname), 'adaptBundle', '-v7.3');
+%%
+model_std = model;
+model_blk = model;
+PropDist_std = PropDist;
+PropDist_blk = PropDist;
+
+%%
+% ============================================================
+% BLOCKED MCMC SETUP (instead of mcmcAdapt)
+% ============================================================
+% Proposal variance for phi random-walk MH
+
+% Proposal scale for the joint latent block F = (hs, deltas)
+
+
+% Proposal scales for Ft updates when factors are sampled by Langevin / MH
+if strcmp(model.sampleFactorsByGibbs, 'no') == 1
+    model.deltaFactors = 0.01 * ones(model.T, 1);
+end
+
+% Inner-loop settings for the blocked kernel
+mcmcoptions.blocks = struct();
+mcmcoptions.blocks.Burnin = 0;   % inner burn-in only
+%% ============================================================
+%  COMPARISON SETUP
+%  Assume mcmcAdapt has already been run:
+%     [model, PropDist, samples_adapt, accRates_adapt] = mcmcAdapt(...)
+% ============================================================
+rng(123);   % optional, for reproducibility
+
+% Clone the adapted state so both samplers start from the same point
+model_std = model;
+model_blk = model;
+PropDist_std = PropDist;
+PropDist_blk = PropDist;
+
+%% ============================================================
+%  STANDARD MCMC WITH mcmcTrain.m
+% ============================================================
+
+M = 500000;   % number of stored samples to compare at the outer level
+
+trainOps_std = struct();
+trainOps_std.Burnin = 0;
+trainOps_std.T = M;
+trainOps_std.StoreEvery = 1;
+
+[model_std, samples_std, accRates_std] = mcmcTrain(model_std, PropDist_std, trainOps_std, Langevin);
+
+% Extract phi samples from standard chain
+phi_h_std = samples_std.Phi_h;             % [M x K]
+phi_delta_std = samples_std.Phi_delta;     % [M x tildeK]
+
+%% ============================================================
+%  BLOCKED MCMC WITH mcmcTrain_blocks.m
+% ============================================================
+tic;
+B_inner = 1;   % choose your blocked inner depth
+trainOps_blk = struct();
+trainOps_blk.Burnin = 0;   % inner burn-in only inside each blocked call
+% Storage for outer samples from blocked kernel
+phi_h_blk = zeros(M, model_blk.K);
+phi_delta_blk = zeros(M, model_blk.tildeK);
+sigma2_h_blk = zeros(M, model_blk.K);
+sigma2_delta_blk = zeros(M, model_blk.tildeK);
+
+h0_blk = zeros(M, model_blk.K);
+delta0_blk = zeros(M, model_blk.tildeK);
+
+accF_blk = zeros(M,1);
+accFt_blk = zeros(M, model_blk.T);
+
+for m = 1:M
+    [model_blk, samples_blk, accRates_blk] = mcmcTrain_blocks( ...
+        model_blk, PropDist_blk, trainOps_blk, Langevin, B_inner);
+
+    % Store OUTER sample only
+    phi_h_blk(m,:) = samples_blk.outer.phi_h;
+    phi_delta_blk(m,:) = samples_blk.outer.phi_delta;
+
+    sigma2_h_blk(m,:) = samples_blk.outer.sigma2_h;
+    sigma2_delta_blk(m,:) = samples_blk.outer.sigma2_delta;
+
+    h0_blk(m,:) = samples_blk.outer.h_0;
+    delta0_blk(m,:) = samples_blk.outer.delta_0;
+
+    % Optional diagnostics
+    accF_blk(m) = accRates_blk.F;
+    accFt_blk(m,:) = accRates_blk.Ft(:)';
+end
+toc;
+%% ============================================================
+%  COMPARE ONE COMPONENT OF phi_h
+% ============================================================
+comp_h =2;   % choose component of phi_h
+figure;
+histogram(phi_h_std(:,comp_h), 30, 'Normalization', 'pdf');
+hold on;
+histogram(phi_h_blk(:,comp_h), 30, 'Normalization', 'pdf');
+legend('mcmcTrain', 'mcmcTrain\_blocks');
+title(sprintf('\\phi_h component %d', comp_h));
+xlabel('\phi_h');
+ylabel('Density');
+grid on;
+%%
+comp_d = 1;   % choose component of phi_delta
+
+figure;
+histogram(phi_delta_std(:,comp_d), 30, 'Normalization', 'pdf');
+hold on;
+histogram(phi_delta_blk(:,comp_d), 30, 'Normalization', 'pdf');
+legend('mcmcTrain', 'mcmcTrain\_blocks');
+title(sprintf('\\phi_\\delta component %d', comp_d));
+xlabel('\phi_\delta');
+ylabel('Density');
+grid on;
+
+%% ============================================================
+%  SUMMARY COMPARISON FOR phi_h
+% ============================================================
+
+mean_phi_h_std = mean(phi_h_std, 1);
+mean_phi_h_blk = mean(phi_h_blk, 1);
+
+var_phi_h_std = var(phi_h_std, 0, 1);
+var_phi_h_blk = var(phi_h_blk, 0, 1);
+
+disp('Mean comparison for phi_h:');
+disp(table((1:model.K)', mean_phi_h_std', mean_phi_h_blk', ...
+    'VariableNames', {'component','mean_std','mean_blk'}));
+
+disp('Variance comparison for phi_h:');
+disp(table((1:model.K)', var_phi_h_std', var_phi_h_blk', ...
+    'VariableNames', {'component','var_std','var_blk'}));
+
+%% ============================================================
+%  SUMMARY COMPARISON FOR phi_delta
+% ============================================================
+
+mean_phi_delta_std = mean(phi_delta_std, 1);
+mean_phi_delta_blk = mean(phi_delta_blk, 1);
+
+var_phi_delta_std = var(phi_delta_std, 0, 1);
+var_phi_delta_blk = var(phi_delta_blk, 0, 1);
+
+disp('Mean comparison for phi_delta:');
+disp(table((1:model.tildeK)', mean_phi_delta_std', mean_phi_delta_blk', ...
+    'VariableNames', {'component','mean_std','mean_blk'}));
+
+disp('Variance comparison for phi_delta:');
+disp(table((1:model.tildeK)', var_phi_delta_std', var_phi_delta_blk', ...
+    'VariableNames', {'component','var_std','var_blk'}));
+
+%%
+%% ============================================================
+%  TRACE COMPARISON
+% ============================================================
+
+comp_h = 1;
+figure;
+plot(phi_h_std(:,comp_h), 'LineWidth', 1);
+hold on;
+plot(phi_h_blk(:,comp_h), 'LineWidth', 1);
+legend('mcmcTrain', 'mcmcTrain\_blocks');
+title(sprintf('Trace of \\phi_h component %d', comp_h));
+xlabel('Iteration');
+ylabel('\phi_h');
+grid on;
+%%
+tic;
+
+M = 10;
+B_inner = 100;   % number of stored inner samples per blocked call
+trainOps_blk = struct();
+trainOps_blk.Burnin = 0;   % inner burn-in inside each blocked call
+
+localHorizon = 5;          % local forecast horizon
+nForecastPerInner = 50;     % number of forecast paths per inner sample
+
+% ------------------------------------------------------------
+% Portfolio / gradient settings
+% ------------------------------------------------------------
+Nassets = size(model_blk.L, 1);
+
+beta = ones(Nassets,1) / Nassets;   % simple equal-weight portfolio
+gamma = 10;                         % example risk aversion
+blockSize = 512;                    % for Sigmar_times_beta_exact
+
+% ------------------------------------------------------------
+% Storage for OUTER samples from blocked kernel
+% ------------------------------------------------------------
+phi_h_blk = zeros(M, model_blk.K);
+phi_delta_blk = zeros(M, model_blk.tildeK);
+
+sigma2_h_blk = zeros(M, model_blk.K);
+sigma2_delta_blk = zeros(M, model_blk.tildeK);
+
+h0_blk = zeros(M, model_blk.K);
+delta0_blk = zeros(M, model_blk.tildeK);
+
+accF_blk = zeros(M,1);
+accFt_blk = zeros(M, model_blk.T);
+
+% ------------------------------------------------------------
+% Storage for FORECAST summaries
+% ------------------------------------------------------------
+hs_fc_mean = zeros(model_blk.K, localHorizon, M);
+deltas_fc_mean = zeros(model_blk.tildeK, localHorizon, M);
+lambdas_fc_mean = zeros(model_blk.K, localHorizon, M);
+omegas_fc_mean = zeros(model_blk.tildeK, localHorizon, M);
+
+hs_fc_var = zeros(model_blk.K, localHorizon, M);
+deltas_fc_var = zeros(model_blk.tildeK, localHorizon, M);
+
+% ------------------------------------------------------------
+% Storage for GRADIENT summaries
+% ------------------------------------------------------------
+grad_by_inner_mean = zeros(Nassets, M);         % average across inner samples
+grad_by_inner_var = zeros(Nassets, M);          % variance across inner samples
+
+grad_xi_by_inner_mean = zeros(Nassets, M);
+mu_by_inner_mean = zeros(Nassets, M);
+SigmarBeta_by_inner_mean = zeros(Nassets, M);
+
+% Optional: store one full call's gradients for dimension checks
+grad_by_inner_last = [];
+grad_xi_by_inner_last = [];
+grad_hbs_last = [];
+mu_by_inner_last = [];
+SigmarBeta_by_inner_last = [];
+
+% ------------------------------------------------------------
+% Basic diagnostics
+% ------------------------------------------------------------
+all_lambda_positive = true(M,1);
+all_omega_in_range = true(M,1);
+any_nan_fc = false(M,1);
+any_nan_grad = false(M,1);
+
+for m = 1:M
+
+    % --------------------------------------------------------
+    % Save PREVIOUS/FROZEN outer sample before blocked update
+    % --------------------------------------------------------
+    outer_prev = struct();
+    outer_prev.h_0 = model_blk.h_0;
+    outer_prev.delta_0 = model_blk.delta_0;
+    outer_prev.sigma2_h = model_blk.sigma2_h;
+    outer_prev.sigma2_delta = model_blk.sigma2_delta;
+    outer_prev.phi_h = model_blk.phi_h;
+    outer_prev.phi_delta = model_blk.phi_delta;
+
+    % --------------------------------------------------------
+    % Run one blocked MCMC transition
+    % --------------------------------------------------------
+    [model_blk, samples_blk, accRates_blk] = mcmcTrain_blocks( ...
+        model_blk, PropDist_blk, trainOps_blk, Langevin, B_inner);
+
+    % --------------------------------------------------------
+    % Store OUTER sample only
+    % --------------------------------------------------------
+    phi_h_blk(m,:) = samples_blk.outer.phi_h;
+    phi_delta_blk(m,:) = samples_blk.outer.phi_delta;
+
+    sigma2_h_blk(m,:) = samples_blk.outer.sigma2_h;
+    sigma2_delta_blk(m,:) = samples_blk.outer.sigma2_delta;
+
+    h0_blk(m,:) = samples_blk.outer.h_0;
+    delta0_blk(m,:) = samples_blk.outer.delta_0;
+
+    accF_blk(m) = accRates_blk.F;
+    accFt_blk(m,:) = accRates_blk.Ft(:)';
+
+    % --------------------------------------------------------
+    % Forecast from the STORED INNER samples using outer_prev
+    % --------------------------------------------------------
+    fc_blk = msv_forecast_states_only_by_blocks( ...
+        samples_blk, model_blk, outer_prev, localHorizon, nForecastPerInner);
+
+    % --------------------------------------------------------
+    % Diagnostics: validity checks for forecast
+    % --------------------------------------------------------
+    all_lambda_positive(m) = all(fc_blk.lambdas_fc(:) > 0);
+    all_omega_in_range(m) = all(fc_blk.omegas_fc(:) > -pi/2 & fc_blk.omegas_fc(:) < pi/2);
+    any_nan_fc(m) = any(isnan(fc_blk.hs_fc(:))) || any(isnan(fc_blk.deltas_fc(:))) ...
+                  || any(isnan(fc_blk.lambdas_fc(:))) || any(isnan(fc_blk.omegas_fc(:)));
+
+    % --------------------------------------------------------
+    % Summary statistics over inner samples and forecast replications
+    % --------------------------------------------------------
+    for hh = 1:localHorizon
+        % hs
+        Xh = reshape(fc_blk.hs_fc(:,hh,:,:), model_blk.K, []);
+        hs_fc_mean(:,hh,m) = mean(Xh, 2);
+        hs_fc_var(:,hh,m) = var(Xh, 0, 2);
+
+        % deltas
+        Xd = reshape(fc_blk.deltas_fc(:,hh,:,:), model_blk.tildeK, []);
+        deltas_fc_mean(:,hh,m) = mean(Xd, 2);
+        deltas_fc_var(:,hh,m) = var(Xd, 0, 2);
+
+        % lambdas
+        Xlam = reshape(fc_blk.lambdas_fc(:,hh,:,:), model_blk.K, []);
+        lambdas_fc_mean(:,hh,m) = mean(Xlam, 2);
+
+        % omegas
+        Xom = reshape(fc_blk.omegas_fc(:,hh,:,:), model_blk.tildeK, []);
+        omegas_fc_mean(:,hh,m) = mean(Xom, 2);
+    end
+
+    % --------------------------------------------------------
+    % Compute gradients from forecast output
+    % --------------------------------------------------------
+    [grad_by_inner, grad_xi_by_inner, grad_hbs, mu_by_inner, SigmarBeta_by_inner] = ...
+        grad_msv_exact_by_blocks(beta, fc_blk, model_blk, gamma, blockSize);
+
+    % --------------------------------------------------------
+    % Diagnostics: validity checks for gradients
+    % --------------------------------------------------------
+    any_nan_grad(m) = any(isnan(grad_by_inner(:))) || any(isnan(grad_xi_by_inner(:))) ...
+                    || any(isnan(grad_hbs(:))) || any(isnan(mu_by_inner(:))) ...
+                    || any(isnan(SigmarBeta_by_inner(:)));
+
+    % --------------------------------------------------------
+    % Store summaries over inner samples
+    % grad_by_inner is [Nassets x B_inner]
+    % --------------------------------------------------------
+    grad_by_inner_mean(:,m) = mean(grad_by_inner, 2);
+    grad_by_inner_var(:,m) = var(grad_by_inner, 0, 2);
+
+    grad_xi_by_inner_mean(:,m) = mean(grad_xi_by_inner, 2);
+    mu_by_inner_mean(:,m) = mean(mu_by_inner, 2);
+    SigmarBeta_by_inner_mean(:,m) = mean(SigmarBeta_by_inner, 2);
+
+    % Save the last realization for dimension inspection
+    if m == M
+        grad_by_inner_last = grad_by_inner;
+        grad_xi_by_inner_last = grad_xi_by_inner;
+        grad_hbs_last = grad_hbs;
+        mu_by_inner_last = mu_by_inner;
+        SigmarBeta_by_inner_last = SigmarBeta_by_inner;
+    end
+end
+
+toc;
+%%
+figure;
+plot(accF_blk);
+title('Acceptance rate of latent block F across blocked calls');
+grid on;
+
+figure;
+plot(mean(accFt_blk,2));
+title('Mean acceptance rate of Ft across blocked calls');
+grid on;
+
+%%
+
+comp_h = 1;
+figure;
+plot(1:localHorizon, mean(squeeze(hs_fc_mean(comp_h,:,:)), 2), '-o');
+hold on;
+yline(mean(h0_blk(:,comp_h)), '--');
+title(sprintf('Forecast mean of h component %d across local horizon', comp_h));
+xlabel('local horizon');
+ylabel('mean forecast h');
+legend('forecast mean','mean h_0');
+grid on;
+%%
+comp_d = 1;
+
+figure;
+plot(1:localHorizon, mean(squeeze(deltas_fc_mean(comp_d,:,:)), 2), '-o');
+hold on;
+yline(mean(delta0_blk(:,comp_d)), '--');
+title(sprintf('Forecast mean of delta component %d across local horizon', comp_d));
+xlabel('local horizon');
+ylabel('mean forecast delta');
+legend('forecast mean','mean delta_0');
+grid on;
+%%
+figure;
+plot(1:localHorizon, mean(squeeze(hs_fc_var(comp_h,:,:)), 2), '-o');
+title(sprintf('Forecast variance of h component %d', comp_h));
+xlabel('local horizon');
+ylabel('variance');
+grid on;
+%%
+disp('Forecast validity checks:')
+disp(all(all_lambda_positive))
+disp(all(all_omega_in_range))
+disp(any(any_nan_fc))
+
+disp('Gradient validity checks:')
+disp(any(any_nan_grad))
+
+disp('Sizes of last gradient outputs:')
+disp(size(grad_by_inner_last))        % should be [Nassets x B_inner]
+disp(size(grad_xi_by_inner_last))     % should be [Nassets x B_inner]
+disp(size(grad_hbs_last))             % should be [Nassets x localHorizon x B_inner x nForecastPerInner]
+disp(size(mu_by_inner_last))          % should be [Nassets x B_inner]
+disp(size(SigmarBeta_by_inner_last))  % should be [Nassets x B_inner]
+%%
+comp = 1;
+
+figure;
+plot(grad_by_inner_mean(comp,:));
+title(sprintf('Mean gradient component %d across blocked calls', comp));
+xlabel('blocked call');
+ylabel('mean grad');
+grid on;
+%%
+%% ============================================================
+% DRAFT: ONE SA STEP WITH M "UNBIASED-STYLE" REPLICATES
+%
+% This is NOT a function yet.
+% It is a prototype to check the logic.
+%
+% Main design choices implemented:
+%   - all M replicates start from the SAME state coming from mcmcAdapt
+%   - each replicate samples its own level l in {0,...,Lmax}
+%   - B_inner = B0 * 2^l
+%   - if l = 0:
+%         Delta_0 = (1/B0) * sum_{b=1}^{B0} g^(b)
+%   - if l >= 1:
+%         Delta_l = (1/B_l) * sum_{b=1}^{B_l/2} ( g^(b+B_l/2) - g^(b) )
+%   - estimator contribution = Delta_l / p_l
+%   - SA gradient estimate = average over the M replicate contributions
+%   - the next chain state is taken from the LAST replicate M
+%
+% Assumes already available in workspace:
+%   model_blk, PropDist_blk, Langevin
+%   mcmcTrain_blocks
+%   msv_forecast_states_only_by_blocks
+%   grad_msv_exact_by_blocks
+%
+% Also assumes:
+%   beta, gamma, blockSize
+%   localHorizon, nForecastPerInner
+%   B0, Lmax, level_probs, M_unb
+%   xi_current, gamma_sa   (if you want to test SA update too)
+% ============================================================
+
+tic;
+
+%% -------------------------------
+% USER / ALGORITHM SETTINGS
+% -------------------------------
+M_unb = 10;                  % number of replicate contributions per SA step
+B0 = 10;                     % base inner length
+Lmax = 2;                    % maximum level
+localHorizon = 5;
+nForecastPerInner = 50;
+level_probs=[1/3,1/3,1/3];
+% level_probs must be length Lmax+1 and sum to 1
+% Example placeholder:
+% level_probs = [0.40, 0.25, 0.18, 0.11, 0.06];
+assert(length(level_probs) == Lmax + 1, 'level_probs must have length Lmax+1');
+assert(abs(sum(level_probs) - 1) < 1e-12, 'level_probs must sum to 1');
+
+% optional
+level_cdf = cumsum(level_probs);
+
+% SA objects (draft placeholders)
+% xi_current = ... ;
+% gamma_sa = ... ;
+
+Nassets = size(model_blk.L, 1);
+
+% Example portfolio vector
+beta = ones(Nassets,1) / Nassets;
+gamma = 10;
+blockSize = 512;
+
+%% -------------------------------
+% COMMON STARTING STATE FOR ALL M REPLICATES
+% -------------------------------
+model_start = model_blk;
+PropDist_start = PropDist_blk;
+
+%% -------------------------------
+% STORAGE FOR REPLICATE OUTPUTS
+% -------------------------------
+level_draws = zeros(M_unb,1);
+B_draws = zeros(M_unb,1);
+
+% one contribution per replicate
+Hhat_by_rep = zeros(Nassets, M_unb);
+Hhat_xi_by_rep = zeros(Nassets, M_unb);
+
+% optional diagnostics
+accF_rep = zeros(M_unb,1);
+accFt_rep = zeros(M_unb, model_start.T);
+
+all_lambda_positive_rep = true(M_unb,1);
+all_omega_in_range_rep = true(M_unb,1);
+any_nan_fc_rep = false(M_unb,1);
+any_nan_grad_rep = false(M_unb,1);
+
+% only keep the terminal state of the LAST replicate
+model_terminal_last = [];
+samples_terminal_last = [];
+outer_prev_last = [];
+
+%% ============================================================
+% LOOP OVER M REPLICATES
+% ============================================================
+for m = 1:M_unb
+
+    % --------------------------------------------
+    % RESET TO THE COMMON STARTING STATE
+    % --------------------------------------------
+    model_m = model_start;
+    PropDist_m = PropDist_start;
+
+    % --------------------------------------------
+    % SAMPLE LEVEL l ~ level_probs
+    % --------------------------------------------
+    u = rand;
+    l = find(u <= level_cdf, 1, 'first') - 1;   % levels start at 0
+    if isempty(l)
+        l = Lmax;
+    end
+
+    level_draws(m) = l;
+
+    % --------------------------------------------
+    % SET INNER LENGTH B_inner = B0 * 2^l
+    % --------------------------------------------
+    B_inner = B0 * 2^l;
+    B_draws(m) = B_inner;
+
+    trainOps_blk = struct();
+    trainOps_blk.Burnin = 0;
+
+    % --------------------------------------------
+    % SAVE PREVIOUS/FROZEN OUTER SAMPLE
+    % This is what forecasting will use
+    % --------------------------------------------
+    outer_prev = struct();
+    outer_prev.h_0 = model_m.h_0;
+    outer_prev.delta_0 = model_m.delta_0;
+    outer_prev.sigma2_h = model_m.sigma2_h;
+    outer_prev.sigma2_delta = model_m.sigma2_delta;
+    outer_prev.phi_h = model_m.phi_h;
+    outer_prev.phi_delta = model_m.phi_delta;
+
+    % --------------------------------------------
+    % RUN BLOCKED CHAIN OF LENGTH B_inner
+    % --------------------------------------------
+    [model_m, samples_blk, accRates_blk] = mcmcTrain_blocks( ...
+        model_m, PropDist_m, trainOps_blk, Langevin, B_inner);
+
+    accF_rep(m) = accRates_blk.F;
+    accFt_rep(m,:) = accRates_blk.Ft(:)';
+
+    % --------------------------------------------
+    % FORECAST FROM ALL STORED INNER SAMPLES
+    % USING outer_prev (the frozen outer sample)
+    % --------------------------------------------
+    fc_blk = msv_forecast_states_only_by_blocks( ...
+        samples_blk, model_m, outer_prev, localHorizon, nForecastPerInner);
+
+    % forecast diagnostics
+    all_lambda_positive_rep(m) = all(fc_blk.lambdas_fc(:) > 0);
+    all_omega_in_range_rep(m) = all(fc_blk.omegas_fc(:) > -pi/2 & fc_blk.omegas_fc(:) < pi/2);
+    any_nan_fc_rep(m) = any(isnan(fc_blk.hs_fc(:))) || any(isnan(fc_blk.deltas_fc(:))) ...
+                      || any(isnan(fc_blk.lambdas_fc(:))) || any(isnan(fc_blk.omegas_fc(:)));
+
+    % --------------------------------------------
+    % COMPUTE PER-INNER-SAMPLE GRADIENTS
+    % averaged over local horizon and forecast replications
+    % grad_by_inner is [Nassets x B_inner]
+    % --------------------------------------------
+    [grad_by_inner, grad_xi_by_inner, grad_hbs, mu_by_inner, SigmarBeta_by_inner] = ...
+        grad_msv_exact_by_blocks(beta, fc_blk, model_m, gamma, blockSize);
+
+    any_nan_grad_rep(m) = any(isnan(grad_by_inner(:))) || any(isnan(grad_xi_by_inner(:))) ...
+                        || any(isnan(grad_hbs(:))) || any(isnan(mu_by_inner(:))) ...
+                        || any(isnan(SigmarBeta_by_inner(:)));
+
+    % --------------------------------------------
+    % BUILD THE LEVEL CONTRIBUTION Delta_l
+    % --------------------------------------------
+    if l == 0
+        % Base estimator:
+        % Delta_0 = (1/B0) sum_{b=1}^{B0} g^(b)
+        Delta = mean(grad_by_inner, 2);
+        Delta_xi = mean(grad_xi_by_inner, 2);
+    else
+        % Coupled fine-coarse split:
+        % Delta_l = (1/B_l) sum_{b=1}^{B_l/2} ( g^(b+B_l/2) - g^(b) )
+        Bh = B_inner / 2;
+        assert(mod(B_inner,2) == 0, 'B_inner must be even for l>=1');
+
+        fine_half = grad_by_inner(:, Bh+1:B_inner);
+        coarse_half = grad_by_inner(:, 1:Bh);
+
+        fine_half_xi = grad_xi_by_inner(:, Bh+1:B_inner);
+        coarse_half_xi = grad_xi_by_inner(:, 1:Bh);
+
+        Delta = sum(fine_half - coarse_half, 2) / B_inner;
+        Delta_xi = sum(fine_half_xi - coarse_half_xi, 2) / B_inner;
+    end
+
+    % --------------------------------------------
+    % SCALE BY 1 / p_l
+    % This is the unbiased-style contribution
+    % (truncated in practice because l <= Lmax)
+    % --------------------------------------------
+    p_l = level_probs(l + 1);
+
+    Hhat_by_rep(:,m) = Delta / p_l;
+    Hhat_xi_by_rep(:,m) = Delta_xi / p_l;
+
+    % --------------------------------------------
+    % KEEP ONLY THE LAST REPLICATE TERMINAL STATE
+    % This will be used as the next chain state
+    % --------------------------------------------
+    if m == M_unb
+        model_terminal_last = model_m;
+        samples_terminal_last = samples_blk;
+        outer_prev_last = outer_prev; %#ok<NASGU>
+    end
+end
+
+%% ============================================================
+% AVERAGE THE M REPLICATE CONTRIBUTIONS
+% ============================================================
+Hhat_mean = mean(Hhat_by_rep, 2);
+Hhat_xi_mean = mean(Hhat_xi_by_rep, 2);
+
+%% ============================================================
+% OPTIONAL SA UPDATE DRAFT
+% ============================================================
+% Example:
+% xi_next = xi_current + gamma_sa * Hhat_xi_mean;
+
+%% ============================================================
+% NEXT CHAIN STATE FOR THE NEXT SA STEP
+% Use the terminal state of the LAST replicate
+% ============================================================
+model_blk_next = model_terminal_last;
+
+%% ============================================================
+% BASIC CHECKS / DIAGNOSTICS
+% ============================================================
+disp('Level draws:');
+disp(level_draws');
+
+disp('B draws:');
+disp(B_draws');
+
+disp('Forecast checks:');
+disp(all(all_lambda_positive_rep));
+disp(all(all_omega_in_range_rep));
+disp(any(any_nan_fc_rep));
+
+disp('Gradient checks:');
+disp(any(any_nan_grad_rep));
+
+disp('Mean acceptance F across replicates:');
+disp(mean(accF_rep));
+
+disp('Mean acceptance Ft across replicates:');
+disp(mean(accFt_rep, 1));
+
+disp('Size of replicate contributions Hhat_by_rep:');
+disp(size(Hhat_by_rep));      % [Nassets x M_unb]
+
+disp('Size of Hhat_mean:');
+disp(size(Hhat_mean));        % [Nassets x 1]
+
+toc;
+
+%%
+
+
+%% ============================================================
+% ADAPT ONCE
+% ============================================================
+
+[model, PropDist, samples, accRates] = ...
+    mcmcAdapt(model, mcmcoptions.adapt, Langevin);
+
+%% ============================================================
+% SA OPTIONS (UNBIASED VERSION)
+% ============================================================
+model.horizon =5;
+saOpts = struct();
+% SA parameters
+saOpts.Ksa       = 5;
+saOpts.gamma     = 3;
+saOpts.blockSize = 512;
+saOpts.a0        = 6000/saOpts.gamma;
+saOpts.aPow      = 0.6;
+saOpts.xiClip    = 20;
+saOpts.seed      = randi(1000);
+% Unbiased estimator parameters
+saOpts.B0        = 1;
+saOpts.Lmax      = 0;
+saOpts.M         = 120;
+q = 4;
+Lmax = saOpts.Lmax;
+levels = 0:Lmax;
+weights = (((levels + q)) .* (log(levels + q)).^2) ./ (2.^levels);
+level_probs = weights / sum(weights);
+saOpts.level_probs = level_probs;
+% Forecast parameters
+saOpts.localHorizon = 5;
+saOpts.nForecastPerInner = 2;
+
+% Misc
+saOpts.threadCount = 1;
+saOpts.verbose     = true;
+
+% initialization
+% saOpts.xi0 = zeros(model.N,1);
+saOpts.xi0 = zeros(model.N,1);   % safer for first test
+%% ============================================================
+% RUN UNBIASED SA
+% ============================================================
+out = unbiased_sa_portfolio_msv(adaptBundle, Langevin, saOpts);
+beta_star = out.beta_final;
+xi_star   = out.xi_final;
+%%
+
+%%
+srb=mean(out.sigmarbeta_hist,2);
+srb(1:50)
+mu_mean=mean(out.mu_hist,2);
+mu_mean(1:50)
+
+
+
+
+
+%% ============================================================
+% BASIC CHECKS
+% ============================================================
+
+disp('Sum beta (should be 1):');
+disp(sum(beta_star))
+disp('[min(beta), max(beta)]:');
+disp([min(beta_star), max(beta_star)])
+
+%% ============================================================
+% OBJECTIVE PROXY
+% ============================================================
+
+figure;
+plot(out.obj_proxy_hist);
+grid on;
+title('Unbiased SA objective proxy');
+
+%% ============================================================
+% ACTIVE ASSETS
+% ============================================================
+
+active_idx = find(out.beta_hist(:,end) > 0.02);
+
+disp('Active assets:');
+disp(active_idx)
+
+disp('Weights of active assets:');
+disp(out.beta_hist(active_idx,end))
+
+%% ============================================================
+% HEATMAP
+% ============================================================
+figure;
+imagesc(out.beta_hist);
+colorbar;
+xlabel('SA iteration');
+ylabel('Asset index i');
+title('\beta_{i,t} heatmap (unbiased SA)');
+colormap turbo;
+%% ============================================================
+% SNAPSHOT PLOT
+% ============================================================
+t = min(20, size(out.beta_hist,2));
+w = out.beta_hist(:, t);
+
+N = numel(w);
+i = 1:N;
+
+figure;
+stem(i, w, 'filled'); hold on; grid on;
+
+yline(1/N, 'r--', 'LineWidth', 2);
+
+xlabel('Asset index i');
+ylabel('\beta_{i,t}');
+title(sprintf('Weights at iteration t = %d (unbiased SA)', t));
+legend('\beta_{i,t}', 'Uniform weight 1/N', 'Location','best');
+
+%% ============================================================
+% LEVEL DIAGNOSTICS
+% ============================================================
+
+figure;
+imagesc(out.level_draws);
+colorbar;
+xlabel('SA iteration');
+ylabel('replicate m');
+title('Sampled levels per replicate');
+
+figure;
+plot(mean(out.level_draws,1));
+title('Mean sampled level per SA iteration');
+xlabel('SA iteration');
+ylabel('Mean level');
+
+%% ============================================================
+% GRADIENT DIAGNOSTICS
+% ============================================================
+
+figure;
+plot(vecnorm(out.grad_xi_hist));
+title('Gradient norm (xi-space)');
+xlabel('SA iteration');
+ylabel('||grad||');
+grid on;
+%%
+out.grad_beta_hist(1:15,1:10)
+%%
+%% ============================================================
+%  Empirical variance of unbiased-estimator levels
+%  For each level ell, force P(L=ell)=1 and estimate:
+%    - mean(Delta_ell)
+%    - cov(Delta_ell)
+%    - var per coordinate
+%    - mean ||Delta_ell||^2
+%    - avg runtime
+%
+%  IMPORTANT:
+%  You may need to adapt the "EXTRACT THE ESTIMATOR" block
+%  depending on the output format of unbiased_sa_portfolio_msv.
+%% ============================================================
+
+clearvars;
+clc;
+
+%% ------------------------------------------------------------
+%  Model setup
+%% ------------------------------------------------------------
+model.horizon = 5;
+
+% You likely already have the rest of model defined elsewhere, e.g.
+% model.N, model.dim, data, parameters, etc.
+%
+% Make sure model.N exists before xi0 below.
+
+%% ------------------------------------------------------------
+%  Base SA / unbiased options
+%% ------------------------------------------------------------
+saOpts = struct();
+% SA parameters
+saOpts.Ksa       = 1;
+saOpts.gamma     = 3;
+saOpts.blockSize = 512;
+saOpts.a0        = 0*6000 / saOpts.gamma;
+saOpts.aPow      = 0.6;
+saOpts.xiClip    = 20;
+saOpts.seed      = randi(1000);
+
+% Unbiased estimator parameters
+saOpts.B0        = 1;
+saOpts.Lmax      = 1;   % <-- change this if you want several levels
+saOpts.M         = 120;
+q = 4;
+
+Lmax   = saOpts.Lmax;
+levels = 0:Lmax;
+
+weights = (((levels + q)) .* (log(levels + q)).^2) ./ (2.^levels);
+level_probs = weights / sum(weights);
+saOpts.level_probs = level_probs;
+
+% Forecast parameters
+saOpts.localHorizon      = 5;
+saOpts.nForecastPerInner = 100;
+
+% Misc
+saOpts.threadCount = 1;
+saOpts.verbose     = true;
+
+% Initialization
+saOpts.xi0 = zeros(model.N,1);
+
+%% ------------------------------------------------------------
+%  Settings for the empirical variance experiment
+%% ------------------------------------------------------------
+nRep = 20;   % number of independent repetitions per level
+% Increase this if the estimator is noisy.
+
+% Optional: store the original PMF so we can later compare against it
+orig_level_probs = saOpts.level_probs;
+
+% Master seed for reproducibility of the variance experiment
+masterSeed = 12345;
+
+%% ------------------------------------------------------------
+%  Containers for results
+%% ------------------------------------------------------------
+level_mean        = cell(Lmax+1,1);
+level_cov         = cell(Lmax+1,1);
+level_var         = cell(Lmax+1,1);
+level_second_mom  = zeros(Lmax+1,1);
+level_mean_norm   = zeros(Lmax+1,1);
+level_avg_time    = zeros(Lmax+1,1);
+level_dim         = zeros(Lmax+1,1);
+
+% Store raw samples if desired
+raw_samples = cell(Lmax+1,1);
+
+%% ------------------------------------------------------------
+%  Loop over levels
+%% ------------------------------------------------------------
+
+for ell = 0:Lmax
+
+    fprintf('\n=============================================\n');
+    fprintf('Estimating statistics for fixed level ell = %d\n', ell);
+    fprintf('=============================================\n');
+
+    % Degenerate PMF at level ell
+    saOpts_ell = saOpts;
+    saOpts_ell.level_probs = zeros(1, Lmax+1);
+    saOpts_ell.level_probs(ell+1) = 1;
+
+    % We do not know the estimator dimension a priori.
+    % We'll discover it from the first successful run.
+    delta_first = [];
+    first_time  = NaN;
+
+    % --------------------------------------------------------
+    % First run: infer dimension
+    % --------------------------------------------------------
+    success = false;
+    trial = 0;
+
+    while ~success
+        trial = trial + 1;
+        saOpts_ell.seed = masterSeed + 100000*ell + trial;
+
+        try
+            tStart = tic;
+            out = unbiased_sa_portfolio_msv(adaptBundle, Langevin, saOpts_ell);
+            first_time = toc(tStart);
+
+            % ====================================================
+            % EXTRACT THE ESTIMATOR (ADAPT THIS BLOCK IF NEEDED)
+            %
+            % Replace this by the correct field in your output.
+            % Examples:
+            %   delta = out.score_u(:);
+            %   delta = out.grad_hat(:);
+            %   delta = out.delta(:);
+            %   delta = out.est(:);
+            %
+            % Here I try a few common possibilities.
+            % ====================================================
+            if isstruct(out)
+                if isfield(out, 'delta')
+                    delta_first = out.delta(:);
+                elseif isfield(out, 'score')
+                    delta_first = out.score(:);
+                elseif isfield(out, 'score_u')
+                    delta_first = out.score_u(:);
+                elseif isfield(out, 'grad')
+                    delta_first = out.grad(:);
+                elseif isfield(out, 'grad_hat')
+                    delta_first = out.grad_hat(:);
+                elseif isfield(out, 'est')
+                    delta_first = out.est(:);
+                else
+                    error(['Could not identify estimator field in output. ' ...
+                           'Please edit the extraction block.']);
+                end
+            else
+                % If the function directly returns the estimator vector
+                delta_first = out(:);
+            end
+
+            success = true;
+
+        catch ME
+            fprintf('First-run failure at level %d, retry %d: %s\n', ...
+                    ell, trial, ME.message);
+            if trial >= 10
+                rethrow(ME);
+            end
+        end
+    end
+
+    d = numel(delta_first);
+    level_dim(ell+1) = d;
+
+    % Preallocate sample matrix and times
+    samples = zeros(nRep, d);
+    runtimes = zeros(nRep, 1);
+
+    % Save first sample
+    samples(1,:) = delta_first.';
+    runtimes(1)  = first_time;
+
+    % --------------------------------------------------------
+    % Remaining repetitions
+    % --------------------------------------------------------
+    for r = 2:nRep
+        saOpts_ell.seed = masterSeed + 100000*ell + r;
+
+        tStart = tic;
+        out = unbiased_sa_portfolio_msv(model, saOpts_ell);
+        runtimes(r) = toc(tStart);
+
+        % ====================================================
+        % EXTRACT THE ESTIMATOR (ADAPT THIS BLOCK IF NEEDED)
+        % ====================================================
+        if isstruct(out)
+            if isfield(out, 'delta')
+                delta_r = out.delta(:);
+            elseif isfield(out, 'score')
+                delta_r = out.score(:);
+            elseif isfield(out, 'score_u')
+                delta_r = out.score_u(:);
+            elseif isfield(out, 'grad')
+                delta_r = out.grad(:);
+            elseif isfield(out, 'grad_hat')
+                delta_r = out.grad_hat(:);
+            elseif isfield(out, 'est')
+                delta_r = out.est(:);
+            else
+                error(['Could not identify estimator field in output. ' ...
+                       'Please edit the extraction block.']);
+            end
+        else
+            delta_r = out(:);
+        end
+
+        if numel(delta_r) ~= d
+            error('Estimator dimension changed across runs at level %d.', ell);
+        end
+
+        samples(r,:) = delta_r.';
+    end
+
+    % --------------------------------------------------------
+    % Empirical statistics
+    % --------------------------------------------------------
+    mu = mean(samples, 1);                 % 1 x d
+    Xc = samples - mu;                     % nRep x d
+
+    if nRep > 1
+        Sigma = (Xc' * Xc) / (nRep - 1);   % d x d sample covariance
+    else
+        Sigma = zeros(d,d);
+    end
+
+    coord_var = diag(Sigma);               % d x 1
+    sq_norms  = sum(samples.^2, 2);        % nRep x 1
+
+    level_mean{ell+1}       = mu(:);
+    level_cov{ell+1}        = Sigma;
+    level_var{ell+1}        = coord_var(:);
+    level_second_mom(ell+1) = mean(sq_norms);
+    level_mean_norm(ell+1)  = norm(mu);
+    level_avg_time(ell+1)   = mean(runtimes);
+    raw_samples{ell+1}      = samples;
+
+    % --------------------------------------------------------
+    % Print summary
+    % --------------------------------------------------------
+    fprintf('Level %d done.\n', ell);
+    fprintf('  Dimension                : %d\n', d);
+    fprintf('  Mean norm                : %.6e\n', level_mean_norm(ell+1));
+    fprintf('  Mean squared norm        : %.6e\n', level_second_mom(ell+1));
+    fprintf('  Avg runtime (sec)        : %.6f\n', level_avg_time(ell+1));
+    fprintf('  Max coord variance       : %.6e\n', max(coord_var));
+    fprintf('  Min coord variance       : %.6e\n', min(coord_var));
+end
+
+%% ------------------------------------------------------------
+%  Combine with the original randomization PMF if desired
+%% ------------------------------------------------------------
+% This estimates the contribution of each level to the second moment
+% of the randomized unbiased estimator:
+%
+%   E || Delta_L / p_L ||^2 = sum_ell E ||Delta_ell||^2 / p_ell
+%
+% provided orig_level_probs(ell+1) > 0.
+second_moment_contrib = nan(Lmax+1,1);
+
+for ell = 0:Lmax
+    p = orig_level_probs(ell+1);
+    if p > 0
+        second_moment_contrib(ell+1) = level_second_mom(ell+1) / p;
+    end
+end
+
+est_total_second_moment = nansum(second_moment_contrib);
+
+fprintf('\n=============================================\n');
+fprintf('Combined diagnostic under original PMF\n');
+fprintf('=============================================\n');
+fprintf('Estimated total second moment: %.6e\n', est_total_second_moment);
+
+%% ------------------------------------------------------------
+%  Save results
+%% ------------------------------------------------------------
+levelStats = struct();
+levelStats.levels                  = levels(:);
+levelStats.orig_level_probs        = orig_level_probs(:);
+levelStats.nRep                    = nRep;
+levelStats.level_mean              = level_mean;
+levelStats.level_cov               = level_cov;
+levelStats.level_var               = level_var;
+levelStats.level_second_mom        = level_second_mom;
+levelStats.level_mean_norm         = level_mean_norm;
+levelStats.level_avg_time          = level_avg_time;
+levelStats.level_dim               = level_dim;
+levelStats.second_moment_contrib   = second_moment_contrib;
+levelStats.est_total_second_moment = est_total_second_moment;
+levelStats.raw_samples             = raw_samples;
+
+save('level_variance_results.mat', 'levelStats');
+
+%% ------------------------------------------------------------
+%  Optional plots
+%% ------------------------------------------------------------
+figure;
+semilogy(levels, level_second_mom, '-o', 'LineWidth', 1.5);
+xlabel('level \ell');
+ylabel('Empirical mean ||\Delta_\ell||^2');
+title('Per-level second moment');
+grid on;
+
+figure;
+plot(levels, level_avg_time, '-o', 'LineWidth', 1.5);
+xlabel('level \ell');
+ylabel('Average runtime (sec)');
+title('Per-level average runtime');
+grid on;
+
+figure;
+semilogy(levels, second_moment_contrib, '-o', 'LineWidth', 1.5);
+xlabel('level \ell');
+ylabel('Empirical contribution E||\Delta_\ell||^2 / p_\ell');
+title('Per-level contribution under original PMF');
+grid on;
+
+%% ============================================================
+% TEST FOR unbiased_sa_portfolio_msv_online.m
+% Compatible with the setup style of test_mcmcTrain_blocks.m
+%
+% Assumes already in workspace:
+%   model, mcmcoptions, Langevin, data_d
+% ============================================================
+rng(123,'twister');
+%% ------------------------------------------------------------
+% Choose an online split
+% ------------------------------------------------------------
+Yfull = data_d;
+[Nfull, Tfull] = size(Yfull);
+
+T0_online = Tfull-250;                 % initial training length
+Honline   = Tfull - T0_online;   % online horizon
+
+assert(Honline > 0, 'Need Tfull > T0_online');
+
+%% ------------------------------------------------------------
+% Build initial model for adaptation on the initial training window only
+% ------------------------------------------------------------
+model0 = model;
+model0.Y = Yfull(:, 1:T0_online);
+model0.N = Nfull;
+model0.T = T0_online;
+model0.horizon = Honline;
+
+% Make sure time-varying fields are trimmed / resized consistently
+tvFields = {'Ft','hs','deltas','omegas','lambdas'};
+for ii = 1:numel(tvFields)
+    f = tvFields{ii};
+    if isfield(model0,f) && ~isempty(model0.(f))
+        A = model0.(f);
+        if size(A,2) >= T0_online
+            model0.(f) = A(:,1:T0_online);
+        else
+            model0.(f) = [A, repmat(A(:,end),1,T0_online-size(A,2))];
+        end
+    end
+end
+
+if isfield(model0,'deltaFactors') && ~isempty(model0.deltaFactors)
+    dF = model0.deltaFactors(:);
+    if numel(dF) >= T0_online
+        model0.deltaFactors = dF(1:T0_online);
+    else
+        model0.deltaFactors = [dF; repmat(dF(end), T0_online-numel(dF), 1)];
+    end
+end
+
+%% ------------------------------------------------------------
+% Adapt once on the initial training window
+% ------------------------------------------------------------
+Langevin=1;
+%tic;
+%[model_adapt, PropDist, samples_adapt, accRates] = ...
+%    mcmcAdapt(model0, mcmcoptions.adapt, Langevin);
+%toc;
+model_adapt=model;
+samples_adapt=samples;
+%% ------------------------------------------------------------
+% Build a FULL model object for the online wrapper
+% Proposal parameters stay fixed; model state can evolve
+% ------------------------------------------------------------
+modelFull = model_adapt;
+modelFull.Y = Yfull;
+modelFull.N = Nfull;
+modelFull.T = Tfull;
+modelFull.horizon = Honline;
+
+% Expand time-varying state fields to full panel length
+for ii = 1:numel(tvFields)
+    f = tvFields{ii};
+    if isfield(modelFull,f) && ~isempty(modelFull.(f))
+        A = modelFull.(f);
+        if size(A,2) < Tfull
+            modelFull.(f) = [A, repmat(A(:,end),1,Tfull-size(A,2))];
+        elseif size(A,2) > Tfull
+            modelFull.(f) = A(:,1:Tfull);
+        end
+    end
+end
+
+% Expand deltaFactors if needed
+if isfield(modelFull,'deltaFactors') && ~isempty(modelFull.deltaFactors)
+    dF = modelFull.deltaFactors(:);
+    if numel(dF) < Tfull
+        modelFull.deltaFactors = [dF; repmat(dF(end), Tfull-numel(dF), 1)];
+    elseif numel(dF) > Tfull
+        modelFull.deltaFactors = dF(1:Tfull);
+    end
+end
+%% ------------------------------------------------------------
+% adaptBundle for the online unbiased wrapper
+% ------------------------------------------------------------
+adaptBundle = struct();
+adaptBundle.model = modelFull;
+adaptBundle.PropDist = PropDist;
+adaptBundle.accRatesAdapt = accRates;
+
+%% ------------------------------------------------------------
+% onlineOpts
+% ------------------------------------------------------------
+onlineOpts = struct();
+onlineOpts.T0 = T0_online;
+onlineOpts.H  = Honline;
+
+% number of SA updates performed at each rebalance date
+onlineOpts.saInnerIters = 50;
+
+% rebalance every localHorizon dates
+onlineOpts.rebalanceEvery = 5;
+
+% do not force model.horizon unless you know you need it
+onlineOpts.forceModelHorizon = false;
+
+onlineOpts.reseedPerRebalance = true;
+onlineOpts.verbose = true;
+
+%% ------------------------------------------------------------
+% Base SA options passed into unbiased_sa_portfolio_msv at each rebalance
+% ------------------------------------------------------------
+saOptsBase = struct();
+% SA parameters
+saOptsBase.gamma     = 20;
+saOptsBase.blockSize = 128;
+saOptsBase.a0        = 40000/saOptsBase.gamma;
+saOptsBase.aPow      = 0.6;
+saOptsBase.seed      = 123;
+saOptsBase.verbose   = true;
+saOptsBase.xiClip    = 20;
+saOptsBase.threadCount = 1;
+% Truncated unbiased-style estimator parameters
+saOptsBase.B0   = 5;
+saOptsBase.Lmax = 1;
+saOptsBase.M    = 10;
+q = 6;
+levels = 0:saOptsBase.Lmax;
+weights = ((levels + q) .* (log(levels + q)).^2) ./ (2.^levels);
+saOptsBase.level_probs = weights / sum(weights);
+
+% Local forecast horizon used INSIDE each local unbiased gradient estimator
+saOptsBase.localHorizon = onlineOpts.rebalanceEvery;
+saOptsBase.nForecastPerInner = 100;
+% Warm start xi
+saOptsBase.xi0 = zeros(modelFull.N,1);
+onlineOpts.saOptsBase = saOptsBase;
+%% ------------------------------------------------------------
+% Run the unbiased online wrapper
+% ------------------------------------------------------------
+tic;
+[outOnline, adaptBundle] = unbiased_sa_portfolio_msv_online( ...
+    adaptBundle, mcmcoptions, Langevin, onlineOpts);
+toc;
+%% ------------------------------------------------------------
+% Save reproducibility file
+% ------------------------------------------------------------
+
+out_dir = fullfile(pwd, 'repro_runs');
+if ~exist(out_dir, 'dir')
+    mkdir(out_dir);
+end
+
+runTag = datestr(now, 'yyyymmdd_HHMMSS');
+
+fname = sprintf(['repro_online_unbiased_stoxx600_N%d_T0%d_H%d_' ...
+                 'gamma%d_B0%d_Lmax%d_M%d_inner%d_reb%d_%s.mat'], ...
+                 modelFull.N, ...
+                 onlineOpts.T0, ...
+                 onlineOpts.H, ...
+                 saOptsBase.gamma, ...
+                 saOptsBase.B0, ...
+                 saOptsBase.Lmax, ...
+                 saOptsBase.M, ...
+                 onlineOpts.saInnerIters, ...
+                 onlineOpts.rebalanceEvery, ...
+                 runTag);
+
+save_path = fullfile(out_dir, fname);
+
+% Store RNG state at the end of the run
+rng_state_after = rng;
+
+% Store useful reproducibility metadata
+repro = struct();
+
+repro.description = 'Unbiased online SA portfolio MSV run';
+repro.created_at = datestr(now);
+repro.data_file = 'sp500_daily_adj_close_and_rets_top400.mat';
+
+repro.Nfull = Nfull;
+repro.Tfull = Tfull;
+repro.T0_online = T0_online;
+repro.Honline = Honline;
+
+repro.data_window.asset_idx = 1:Nfull;
+repro.data_window.time_idx = 1:Tfull;
+
+repro.rng_initial_seed = 123;
+repro.rng_state_after = rng_state_after;
+
+repro.onlineOpts = onlineOpts;
+repro.saOptsBase = saOptsBase;
+repro.mcmcoptions = mcmcoptions;
+repro.Langevin = Langevin;
+
+% Save the important objects
+save(save_path, ...
+    'outOnline', ...
+    'adaptBundle', ...
+    'modelFull', ...
+    'model0', ...
+    'model_adapt', ...
+    'samples_adapt', ...
+    'PropDist', ...
+    'accRates', ...
+    'onlineOpts', ...
+    'saOptsBase', ...
+    'mcmcoptions', ...
+    'Langevin', ...
+    'repro', ...
+    '-v7.3');
+
+fprintf('\nSaved reproducibility file:\n%s\n', save_path);
+
+
+%% ------------------------------------------------------------
+% Basic checks
+% ------------------------------------------------------------
+beta_star = outOnline.beta(:, end);
+xi_star   = outOnline.xi(:, end);
+disp('sum(beta_star):');
+disp(sum(beta_star));
+
+disp('[min(beta_star), max(beta_star)]:');
+disp([min(beta_star), max(beta_star)]);
+
+%% ------------------------------------------------------------
+% Objective proxy
+% ------------------------------------------------------------
+figure;
+plot(outOnline.obj_proxy, 'LineWidth', 1.5);
+grid on;
+xlabel('Online date h');
+ylabel('Objective proxy');
+title('Unbiased online SA objective proxy');
+
+%% ------------------------------------------------------------
+% Active assets
+% ------------------------------------------------------------
+[row, column] = find(outOnline.beta > 0.01);
+disp('Indices of active weights > 0.01:');
+disp([row, column]);
+
+%% ------------------------------------------------------------
+% Heatmap of weights
+% ------------------------------------------------------------
+figure;
+imagesc(outOnline.beta);
+colorbar;
+xlabel('Online date h');
+ylabel('Asset index i');
+title('\beta_{i,h} heatmap (unbiased online)');
+colormap turbo;
+%% ------------------------------------------------------------
+% Snapshot of weights at one online date
+% ------------------------------------------------------------
+t = min(50, size(outOnline.beta,2));    % pick one online date
+w = outOnline.beta(:, t);
+
+N = numel(w);
+i = 1:N;
+
+figure;
+stem(i, w, 'filled'); hold on; grid on;
+yline(1/N, 'r--', 'LineWidth', 2);
+xlabel('Asset index i');
+ylabel('\beta_{i,t}');
+title(sprintf('Weights at online date t = %d', t));
+legend('\beta_{i,t}', 'Uniform weight 1/N', 'Location','best');
+
+%% ------------------------------------------------------------
+% Rebalance diagnostics
+% ------------------------------------------------------------
+figure;
+stairs(outOnline.rebalanceFlag, 'LineWidth', 1.5);
+grid on;
+xlabel('Online date h');
+ylabel('Rebalance flag');
+title('Rebalance dates');
+
+if isfield(outOnline, 'selectedLevel')
+    figure;
+    plot(outOnline.selectedLevel, 'o-');
+    grid on;
+    xlabel('Online date h');
+    ylabel('Selected propagated level');
+    title('Level used for propagated chain state');
+end
+
+%% ------------------------------------------------------------
+% Wealth backtest over the online horizon
+% ------------------------------------------------------------
+% online window = last Honline dates after the initial training window
+Y_trade = Yfull(:, T0_online+1 : T0_online+Honline);   % [N x H]
+R = exp(Y_trade) - 1;                                   % simple returns
+
+beta = outOnline.beta;                                  % [N x H]
+V0 = 1;
+
+V_msv  = zeros(1, Honline+1);
+V_unif = zeros(1, Honline+1);
+V_msv(1)  = V0;
+V_unif(1) = V0;
+
+beta_unif_full = ones(Nfull,1)/Nfull;
+
+for t = 1:Honline
+    rt = R(:,t);
+
+    % ---------- MSV wealth ----------
+    bt = beta(:,t);
+    ok_msv = isfinite(rt) & isfinite(bt);
+
+    if any(ok_msv)
+        bt_ok = bt(ok_msv);
+        s = sum(bt_ok);
+        if s > 0
+            bt_ok = bt_ok / s;
+            r_msv = bt_ok' * rt(ok_msv);
+        else
+            r_msv = 0;
+        end
+    else
+        r_msv = 0;
+    end
+
+    % ---------- Uniform wealth ----------
+    ok_u = isfinite(rt);
+    if any(ok_u)
+        bu_ok = beta_unif_full(ok_u);
+        bu_ok = bu_ok / sum(bu_ok);
+        r_unif = bu_ok' * rt(ok_u);
+    else
+        r_unif = 0;
+    end
+
+    V_msv(t+1)  = V_msv(t)  * (1 + r_msv);
+    V_unif(t+1) = V_unif(t) * (1 + r_unif);
+end
+
+tgrid = 0:Honline;
+
+figure;
+plot(tgrid, V_msv,  'LineWidth', 2.0); hold on; grid on;
+plot(tgrid, V_unif, 'LineWidth', 2.0);
+xlabel('t (days)');
+ylabel('Wealth V_t');
+title(sprintf('Wealth over online horizon H=%d', Honline));
+legend('Unbiased MSV betas','Uniform 1/N','Location','best');
+
+figure;
+plot(tgrid, log(V_msv),  'LineWidth', 2.0); hold on; grid on;
+plot(tgrid, log(V_unif), 'LineWidth', 2.0);
+xlabel('t (days)');
+ylabel('log Wealth');
+title(sprintf('Log-wealth over online horizon H=%d', Honline));
+legend('Unbiased MSV betas','Uniform 1/N','Location','best');
+
+%% ------------------------------------------------------------
+% Sharpe and simple performance table
+% ------------------------------------------------------------
+rp_msv  = zeros(Honline,1);
+rp_unif = zeros(Honline,1);
+turnover = zeros(Honline,1);
+
+for t = 1:Honline
+    rt = R(:,t);
+    bt = beta(:,t);
+
+    ok = isfinite(rt) & isfinite(bt);
+
+    if any(ok)
+        bt_ok = bt(ok);
+        bt_ok = bt_ok / sum(bt_ok);
+        rp_msv(t) = bt_ok' * rt(ok);
+
+        bu_ok = beta_unif_full(ok);
+        bu_ok = bu_ok / sum(bu_ok);
+        rp_unif(t) = bu_ok' * rt(ok);
+    else
+        rp_msv(t) = 0;
+        rp_unif(t) = 0;
+    end
+
+    if t > 1
+        turnover(t) = sum(abs(beta(:,t) - beta(:,t-1)));
+    end
+end
+
+W_msv  = cumprod(1 + rp_msv);
+W_unif = cumprod(1 + rp_unif);
+
+S_msv  = W_msv(end);
+S_unif = W_unif(end);
+
+APR_msv  = S_msv^(252/Honline) - 1;
+APR_unif = S_unif^(252/Honline) - 1;
+
+Vol_msv  = std(rp_msv)  * sqrt(252);
+Vol_unif = std(rp_unif) * sqrt(252);
+
+Sharpe_msv  = mean(rp_msv)  / std(rp_msv)  * sqrt(252);
+Sharpe_unif = mean(rp_unif) / std(rp_unif) * sqrt(252);
+
+max_drawdown = @(W) max((cummax(W) - W) ./ cummax(W));
+
+MDD_msv  = max_drawdown(W_msv);
+MDD_unif = max_drawdown(W_unif);
+
+Calmar_msv  = APR_msv  / MDD_msv;
+Calmar_unif = APR_unif / MDD_unif;
+
+AvgTurnover = mean(turnover(2:end));
+
+tc = 0.001;
+rp_msv_tc = rp_msv - tc * turnover;
+W_msv_tc = cumprod(1 + rp_msv_tc);
+S_msv_tc = W_msv_tc(end);
+
+fprintf('\n================= PERFORMANCE TABLE =================\n');
+fprintf('Strategy        | FinalW |   APR   |  Vol   | Sharpe |  MDD  | Calmar\n');
+fprintf('----------------------------------------------------------------------\n');
+fprintf('Unbiased MSV-SA | %6.2f | %6.2f%% | %6.2f%% | %6.2f | %6.2f%% | %6.2f\n', ...
+    S_msv, 100*APR_msv, 100*Vol_msv, Sharpe_msv, 100*MDD_msv, Calmar_msv);
+
+fprintf('Uniform 1/N     | %6.2f | %6.2f%% | %6.2f%% | %6.2f | %6.2f%% | %6.2f\n', ...
+    S_unif, 100*APR_unif, 100*Vol_unif, Sharpe_unif, 100*MDD_unif, Calmar_unif);
+fprintf('----------------------------------------------------------------------\n');
+fprintf('Avg turnover (Unbiased MSV): %.4f\n', AvgTurnover);
+fprintf('Final wealth with TC (Unbiased MSV): %.2f\n', S_msv_tc);
+fprintf('=====================================================\n');
+
+%%
+%% ------------------------------------------------------------
+% Paper-style performance metrics
+% ------------------------------------------------------------
+
+metrics = struct();
+
+% Helper functions
+ann_return = @(rp) prod(1 + rp).^(252/numel(rp)) - 1;
+ann_vol    = @(rp) std(rp) * sqrt(252);
+sharpe     = @(rp) mean(rp) / std(rp) * sqrt(252);
+
+wealth     = @(rp) cumprod(1 + rp);
+mdd_fun    = @(W) max((cummax(W) - W) ./ cummax(W));
+
+avg_gain   = @(rp) mean(rp(rp > 0));
+avg_loss   = @(rp) mean(rp(rp < 0));
+win_trades = @(rp) mean(rp > 0);
+
+%% Unbiased MSV-SA metrics
+W_msv = wealth(rp_msv);
+
+metrics.msv.FinalW = W_msv(end);
+metrics.msv.AnnR   = ann_return(rp_msv);
+metrics.msv.AnnV   = ann_vol(rp_msv);
+metrics.msv.Sharpe = sharpe(rp_msv);
+metrics.msv.MDD    = mdd_fun(W_msv);
+metrics.msv.Calmar = metrics.msv.AnnR / metrics.msv.MDD;
+
+metrics.msv.Gain   = avg_gain(rp_msv);
+metrics.msv.Loss   = avg_loss(rp_msv);
+metrics.msv.WT     = win_trades(rp_msv);
+metrics.msv.TO     = mean(turnover(2:end));
+
+%% Uniform 1/N metrics
+W_unif = wealth(rp_unif);
+
+metrics.unif.FinalW = W_unif(end);
+metrics.unif.AnnR   = ann_return(rp_unif);
+metrics.unif.AnnV   = ann_vol(rp_unif);
+metrics.unif.Sharpe = sharpe(rp_unif);
+metrics.unif.MDD    = mdd_fun(W_unif);
+metrics.unif.Calmar = metrics.unif.AnnR / metrics.unif.MDD;
+
+metrics.unif.Gain   = avg_gain(rp_unif);
+metrics.unif.Loss   = avg_loss(rp_unif);
+metrics.unif.WT     = win_trades(rp_unif);
+metrics.unif.TO     = 0;
+
+%% ------------------------------------------------------------
+% Print table
+% ------------------------------------------------------------
+
+fprintf('\n========================= PERFORMANCE TABLE =========================\n');
+fprintf('Strategy        | FinalW | %% gain | %% loss |  MDD  | %% WT  |   TO   | Ann.R | Ann.V | Sharpe | Calmar\n');
+fprintf('--------------------------------------------------------------------------------------------------------\n');
+
+fprintf('Unbiased MSV-SA | %6.2f | %6.2f | %6.2f | %6.2f | %6.2f | %6.4f | %6.2f | %6.2f | %6.2f | %6.2f\n', ...
+    metrics.msv.FinalW, ...
+    100*metrics.msv.Gain, ...
+    100*metrics.msv.Loss, ...
+    100*metrics.msv.MDD, ...
+    100*metrics.msv.WT, ...
+    metrics.msv.TO, ...
+    100*metrics.msv.AnnR, ...
+    100*metrics.msv.AnnV, ...
+    metrics.msv.Sharpe, ...
+    metrics.msv.Calmar);
+
+fprintf('Uniform 1/N     | %6.2f | %6.2f | %6.2f | %6.2f | %6.2f | %6.4f | %6.2f | %6.2f | %6.2f | %6.2f\n', ...
+    metrics.unif.FinalW, ...
+    100*metrics.unif.Gain, ...
+    100*metrics.unif.Loss, ...
+    100*metrics.unif.MDD, ...
+    100*metrics.unif.WT, ...
+    metrics.unif.TO, ...
+    100*metrics.unif.AnnR, ...
+    100*metrics.unif.AnnV, ...
+    metrics.unif.Sharpe, ...
+    metrics.unif.Calmar);
+
+fprintf('--------------------------------------------------------------------------------------------------------\n');
+
+%% ============================================================
+% Empirical variance of fixed-level contributions in
+% unbiased_sa_portfolio_msv
+%
+% This estimates, for each level ell:
+%   - mean of the level contribution
+%   - covariance matrix
+%   - coordinate-wise variances
+%   - mean squared norm
+%   - average runtime
+%
+% IMPORTANT:
+% To estimate the variance of a SINGLE level contribution,
+% set:
+%   saOpts.Ksa = 1;
+%   saOpts.M   = 1;
+%
+% If instead M > 1, you are estimating the variance of the
+% average over M replicate contributions.
+%% ============================================================
+
+clearvars -except adaptBundle Langevin
+clc
+
+%% ------------------------------------------------------------
+% Base options
+%% ------------------------------------------------------------
+saOpts = struct();
+
+% SA parameters
+saOpts.Ksa       = 1;     % IMPORTANT: one SA iteration only
+saOpts.gamma     = 10;
+saOpts.blockSize = 512;
+saOpts.a0        = 0*6000/saOpts.gamma;
+saOpts.aPow      = 0.6;
+saOpts.xiClip    = 20;
+saOpts.seed      = 1234;
+% Unbiased estimator parameters
+saOpts.B0        = 3;
+saOpts.Lmax      = 7;     % choose the range you want to analyze
+saOpts.M         = 1;     % IMPORTANT: one replicate only
+
+q = 4;
+Lmax   = saOpts.Lmax;
+levels = 0:Lmax;
+
+weights = ((levels + q) .* (log(levels + q)).^2) ./ (2.^levels);
+orig_level_probs = weights / sum(weights);
+saOpts.level_probs = orig_level_probs;
+
+% Forecast parameters
+saOpts.localHorizon      = 2;
+saOpts.nForecastPerInner = 100;
+
+% Misc
+saOpts.threadCount = 1;
+saOpts.verbose     = false;
+
+% Initialization
+N = adaptBundle.model.N;
+saOpts.xi0 = zeros(N,1);
+
+%% ------------------------------------------------------------
+% Experiment settings
+%% ------------------------------------------------------------
+nRep = 40;              % number of independent runs per level
+masterSeed = 24680;
+
+%% ------------------------------------------------------------
+% Containers
+%% ------------------------------------------------------------
+level_mean        = cell(Lmax+1,1);
+level_cov         = cell(Lmax+1,1);
+level_var         = cell(Lmax+1,1);
+level_second_mom  = zeros(Lmax+1,1);
+level_mean_norm   = zeros(Lmax+1,1);
+level_avg_time    = zeros(Lmax+1,1);
+
+raw_samples_xi    = cell(Lmax+1,1);
+raw_samples_beta  = cell(Lmax+1,1);
+
+%% ------------------------------------------------------------
+% Loop over levels
+%% ------------------------------------------------------------
+for ell = 0:Lmax
+    fprintf('\n=============================================\n');
+    fprintf('Fixed level ell = %d\n', ell);
+    fprintf('=============================================\n');
+
+    % Degenerate PMF at ell
+    saOpts_ell = saOpts;
+    saOpts_ell.level_probs = zeros(1, Lmax+1);
+    saOpts_ell.level_probs(ell+1) = 1;
+
+    samples_xi = zeros(nRep, N);
+    samples_beta = zeros(nRep, N);
+    runtimes = zeros(nRep,1);
+    drawn_levels = zeros(nRep,1);
+    drawn_B = zeros(nRep,1);
+
+    for r = 1:nRep
+        saOpts_ell.seed = masterSeed + 100000*ell + r;
+
+        tStart = tic;
+        out = unbiased_sa_portfolio_msv(adaptBundle, Langevin, saOpts_ell);
+        runtimes(r) = toc(tStart);
+
+        % Since Ksa = 1 and M = 1:
+        %   out.grad_xi_hist(:,1) is the single fixed-level contribution
+        %   out.grad_beta_hist(:,1) is the corresponding beta-gradient
+        samples_xi(r,:)   = out.grad_xi_hist(:,1).';
+        samples_beta(r,:) = out.grad_beta_hist(:,1).';
+
+        drawn_levels(r) = out.level_draws(1,1);
+        drawn_B(r)      = out.B_draws(1,1);
+    end
+    samples_xi(:,1:4)
+
+    % Sanity checks
+    if any(drawn_levels ~= ell)
+        error('Some runs did not use the requested fixed level ell=%d.', ell);
+    end
+
+    expected_B = saOpts.B0 * 2^ell;
+    if any(drawn_B ~= expected_B)
+        error('Unexpected B_draws at level %d.', ell);
+    end
+
+    % ---- statistics for xi-gradient estimator ----
+    mu_xi = mean(samples_xi, 1);
+    Xc_xi = samples_xi - mu_xi;
+
+    if nRep > 1
+        Sigma_xi = (Xc_xi' * Xc_xi) / (nRep - 1);
+    else
+        Sigma_xi = zeros(N,N);
+    end
+
+    coord_var_xi = diag(Sigma_xi);
+    sq_norms_xi  = sum(samples_xi.^2, 2);
+
+    level_mean{ell+1}       = mu_xi(:);
+    level_cov{ell+1}        = Sigma_xi;
+    level_var{ell+1}        = coord_var_xi(:);
+    level_second_mom(ell+1) = mean(sq_norms_xi);
+    level_mean_norm(ell+1)  = norm(mu_xi);
+    level_avg_time(ell+1)   = mean(runtimes);
+
+    raw_samples_xi{ell+1}   = samples_xi;
+    raw_samples_beta{ell+1} = samples_beta;
+
+    fprintf('Level %d done.\n', ell);
+    fprintf('  mean ||Ehat||              = %.6e\n', level_mean_norm(ell+1));
+    fprintf('  E ||Ehat||^2               = %.6e\n', level_second_mom(ell+1));
+    fprintf('  avg runtime (sec)          = %.6f\n', level_avg_time(ell+1));
+    fprintf('  max coord variance         = %.6e\n', max(coord_var_xi));
+    fprintf('  min coord variance         = %.6e\n', min(coord_var_xi));
+end
+
+%% ------------------------------------------------------------
+% Contributions under the original PMF
+%% ------------------------------------------------------------
+second_moment_contrib = zeros(Lmax+1,1);
+for ell = 0:Lmax
+    p = orig_level_probs(ell+1);
+    level_second_mom(ell+1)
+    second_moment_contrib(ell+1) = level_second_mom(ell+1) / p;
+end
+
+est_total_second_moment = sum(second_moment_contrib);
+
+fprintf('\n=============================================\n');
+fprintf('Combined second-moment diagnostic\n');
+fprintf('=============================================\n');
+fprintf('Estimated total second moment = %.6e\n', est_total_second_moment);
+%%
+for i=1:(Lmax+1)
+    mean(level_var{i})
+end
+%% ------------------------------------------------------------
+% Save results
+%% ------------------------------------------------------------
+%levelStats = struct();
+%levelStats.levels                  = levels(:);
+%levelStats.orig_level_probs        = orig_level_probs(:);
+%levelStats.nRep                    = nRep;
+%levelStats.level_mean              = level_mean;
+%levelStats.level_cov               = level_cov;
+%levelStats.level_var               = level_var;
+%levelStats.level_second_mom        = level_second_mom;
+%levelStats.level_mean_norm         = level_mean_norm;
+%levelStats.level_avg_time          = level_avg_time;
+%levelStats.second_moment_contrib   = second_moment_contrib;
+%levelStats.est_total_second_moment = est_total_second_moment;
+%levelStats.raw_samples_xi          = raw_samples_xi;
+%levelStats.raw_samples_beta        = raw_samples_beta;
+%
+%save('level_variance_results.mat', 'levelStats');
+
+%% ------------------------------------------------------------
+% Optional plots
+%% ------------------------------------------------------------
+figure;
+semilogy(levels, level_second_mom, '-o', 'LineWidth', 1.5);
+xlabel('level \ell');
+ylabel('Empirical mean ||\Delta_\ell||^2');
+title('Per-level second moment');
+grid on;
+
+figure;
+plot(levels, level_avg_time, '-o', 'LineWidth', 1.5);
+xlabel('level \ell');
+ylabel('Average runtime (sec)');
+title('Per-level average runtime');
+grid on;
+
+figure;
+semilogy(levels, second_moment_contrib, '-o', 'LineWidth', 1.5);
+xlabel('level \ell');
+ylabel('Empirical contribution E||\Delta_\ell||^2 / p_\ell');
+title('Per-level contribution under original PMF');
+grid on;

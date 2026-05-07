@@ -3,7 +3,7 @@ close all;
 outdir = 'diagrams/';
 rng('default')
 %%
-load sp500_top50_daily_adj_close_and_rets.mat;
+load stoxx600_daily_adj_close_and_rets_top50.mat;
 
 %%
 model.horizon  = 1; %forecast horizon
@@ -337,7 +337,7 @@ toc;
 %
 %repro.description = 'Unbiased online SA portfolio MSV run';
 %repro.created_at = datestr(now);
-%repro.data_file = 'sp500_daily_adj_close_and_rets_top400.mat';
+%repro.data_file = 'stoxx600_daily_adj_close_and_rets_top400.mat';
 %
 %repro.Nfull = Nfull;
 %repro.Tfull = Tfull;
